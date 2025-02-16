@@ -5,24 +5,55 @@ using System.Text.Json;
 using Microsoft.Data.SqlClient;
 using System.Threading.Tasks;
 using MQTTnet;
+using MQTTnet.Exceptions;
+
 
 class Program
 {
-    private static string connectionString = "Server=localhost;Database=pubs;User Id=engineer;Password=engineer;TrustServerCertificate=True;";
+    private static string connectionString = "Server=localhost;Database=pubs;Integrated Security=True;TrustServerCertificate=True;";
     private static string query = "SELECT au_id, au_lname, au_fname FROM [dbo].[authors]";
     private static IMqttClient? mqttClient;
+    private static MqttClientOptions? mqttOptions;
+    private static Queue<string> messageCache = new Queue<string>();
 
     static async Task Main(string[] args)
     {
         // Initialize MQTT client
         var factory = new MqttClientFactory();
         mqttClient = factory.CreateMqttClient();
-        var options = new MqttClientOptionsBuilder()
+        mqttOptions = new MqttClientOptionsBuilder()
             .WithClientId("ClientID")
             .WithTcpServer("192.168.88.1", 1883)
             .Build();
 
-        await mqttClient.ConnectAsync(options, CancellationToken.None);
+        mqttClient.DisconnectedAsync += async e =>
+        {
+            Console.WriteLine("Disconnected from MQTT server. Attempting to reconnect...");
+            while (!mqttClient.IsConnected)
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(5)); // Wait before reconnecting
+                    await mqttClient.ConnectAsync(mqttOptions, CancellationToken.None);
+                    Console.WriteLine("Reconnected to MQTT server.");
+                    await SendCachedMessages();
+                }
+                catch (MqttCommunicationException ex)
+                {
+                    Console.WriteLine($"Reconnection failed: {ex.Message}");
+                }
+            }
+        };
+
+        try
+        {
+            await mqttClient.ConnectAsync(mqttOptions, CancellationToken.None);
+        }
+        catch (MqttCommunicationException ex)
+        {
+            Console.WriteLine($"Failed to connect to MQTT server: {ex.Message}");
+            return;
+        }
 
         // Set up SQL dependency
         SqlDependency.Start(connectionString);
@@ -72,8 +103,27 @@ class Program
 
             if (mqttClient?.IsConnected == true)
             {
-                await mqttClient.PublishAsync(message, CancellationToken.None);
-                Console.WriteLine("Data transmitted via MQTT.");
+                try
+                {
+                    await mqttClient.PublishAsync(message, CancellationToken.None);
+                    Console.WriteLine("Data transmitted via MQTT.");
+                }
+                catch (MqttCommunicationException ex)
+                {
+                    Console.WriteLine($"Failed to send MQTT message: {ex.Message}");
+                    if (newData != null)
+                    {
+                        messageCache.Enqueue(newData);
+                    }
+                }
+            }
+            else
+            {
+                if (newData != null)
+                {
+                    Console.WriteLine("Write Change to Cache");
+                    messageCache.Enqueue(newData);
+                }
             }
 
             // Re-register dependency
@@ -115,4 +165,31 @@ class Program
 
         return JsonSerializer.Serialize(payload);
     }
+
+    private static async Task SendCachedMessages()
+    {
+        while (messageCache.Count > 0)
+        {
+            var cachedMessage = messageCache.Dequeue();
+            var message = new MqttApplicationMessageBuilder()
+                .WithTopic("MSQL/Data")
+                .WithPayload(cachedMessage)
+                .WithQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.ExactlyOnce)
+                .WithRetainFlag()
+                .Build();
+
+            try
+            {
+                await mqttClient.PublishAsync(message, CancellationToken.None);
+                Console.WriteLine("Cached data transmitted via MQTT.");
+            }
+            catch (MqttCommunicationException ex)
+            {
+                Console.WriteLine($"Failed to send cached MQTT message: {ex.Message}");
+                messageCache.Enqueue(cachedMessage);
+                break;
+            }
+        }
+    }
 }
+
