@@ -6,59 +6,121 @@ using Microsoft.Data.SqlClient;
 using System.Threading.Tasks;
 using MQTTnet;
 using MQTTnet.Exceptions;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Serilog;
 
 
 class Program
 {
-    private static string connectionString = "Server=localhost;Database=pubs;Integrated Security=True;TrustServerCertificate=True;";
-    private static string query = "SELECT au_id, au_lname, au_fname FROM [dbo].[authors]";
+    private static string? connectionString;
+    private static string? ChangeDetectQuery;
+    private static string? DataQuery;
+    private static string? MqttClientId;
+    private static string? IpAdressMqttBroker;
+    private static int PortMqttBroker = 1883;
+    private static string? MqttTopic;
+    private static string? DebugLocation;
+
     private static IMqttClient? mqttClient;
     private static MqttClientOptions? mqttOptions;
     private static Queue<string> messageCache = new Queue<string>();
 
     static async Task Main(string[] args)
     {
+        using IHost host = Host.CreateApplicationBuilder(args).Build();
+
+        // Ask the service provider for the configuration abstraction.
+        IConfiguration config = host.Services.GetRequiredService<IConfiguration>();
+
+        // Read the appsettings.json file from the settings, with default values if not found.
+        connectionString = config.GetValue<string>("DatabaseSettings:ConnectionString") ?? "Server =localhost;Database=pubs;Integrated Security=True;TrustServerCertificate=True;";
+        ChangeDetectQuery = config.GetValue<string>("DatabaseSettings:DataChangeQuery") ?? "\"SELECT au_id, au_lname, au_fname FROM [dbo].[authors]";
+        DataQuery = config.GetValue<string>("DatabaseSettings:DataQuery") ?? "\"SELECT au_id, au_lname, au_fname FROM [dbo].[authors]";
+        MqttClientId = config.GetValue<string>("MqttSettings:ClientId") ?? "ClientID";
+        IpAdressMqttBroker = config.GetValue<string>("MqttSettings:IpAddress") ?? "192.168.88.1";
+        PortMqttBroker = config.GetValue<int>("MqttSettings:Port");
+        MqttTopic = config.GetValue<string>("MqttSettings:Topic") ?? "MSQL/Data";
+        DebugLocation = config.GetValue<string>("Logger:location") ?? "Console";
+
+        // Set up logger
+        var loggerConfig = new LoggerConfiguration()
+          .MinimumLevel.Debug();
+
+        if (DebugLocation == "Console")
+        {
+            loggerConfig.WriteTo.Console();
+        }
+        else
+        {
+            loggerConfig.WriteTo.File("log.txt", shared: true, rollingInterval: RollingInterval.Day);
+        }
+        Log.Logger = loggerConfig.CreateLogger();
+
+        // Set up SQL dependency with retry mechanism
+        await StartSqlDependencyWithRetry();
+
+        Log.Logger.Information("Listening for database changes...");
+
         // Initialize MQTT client
         var factory = new MqttClientFactory();
         mqttClient = factory.CreateMqttClient();
         mqttOptions = new MqttClientOptionsBuilder()
-            .WithClientId("ClientID")
-            .WithTcpServer("192.168.88.1", 1883)
+            .WithClientId(MqttClientId)
+            .WithTcpServer(IpAdressMqttBroker, PortMqttBroker)
             .Build();
 
         mqttClient.DisconnectedAsync += async e =>
         {
-            Console.WriteLine("Disconnected from MQTT server. Attempting to reconnect...");
+            Log.Logger.Information("Disconnected from MQTT server. Attempting to reconnect...");
             while (!mqttClient.IsConnected)
             {
                 try
                 {
                     await Task.Delay(TimeSpan.FromSeconds(5)); // Wait before reconnecting
                     await mqttClient.ConnectAsync(mqttOptions, CancellationToken.None);
-                    Console.WriteLine("Reconnected to MQTT server.");
+                    Log.Logger.Information("Reconnected to MQTT server.");
                     await SendCachedMessages();
                 }
                 catch (MqttCommunicationException ex)
                 {
-                    Console.WriteLine($"Reconnection failed: {ex.Message}");
+                    Log.Logger.Error($"Reconnection failed: {ex.Message}");
                 }
             }
         };
 
-        try
+        // Set up retry parameters
+        int retryCount = 0;
+        const int maxRetries = 15;
+        const int delayBetweenRetries = 6000; // 6 seconds
+
+        // Retry loop for MQTT connection
+        while (retryCount < maxRetries)
         {
-            await mqttClient.ConnectAsync(mqttOptions, CancellationToken.None);
-        }
-        catch (MqttCommunicationException ex)
-        {
-            Console.WriteLine($"Failed to connect to MQTT server: {ex.Message}");
-            return;
+            try
+            {
+                var cts = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+                if (!mqttClient.IsConnected)
+                {
+                    await mqttClient.ConnectAsync(mqttOptions, cts.Token);
+                }
+                Log.Logger.Information("Connected to MQTT server.");
+                break; // Exit the loop if successful
+            }
+            catch (Exception ex)
+            {
+                retryCount++;
+                Log.Logger.Error($"Failed to connect to MQTT server: {ex.Message}. Retrying {retryCount}/{maxRetries}...");
+                if (retryCount >= maxRetries)
+                {
+                    Log.Logger.Error("Max retry attempts reached. Exiting...");
+                    Environment.Exit(1); // Exit the program gracefully
+                }
+                await Task.Delay(delayBetweenRetries);
+            }
         }
 
-        // Set up SQL dependency with retry mechanism
-        await StartSqlDependencyWithRetry();
-
-        Console.WriteLine("Listening for database changes...");
         await Task.Delay(Timeout.Infinite); //wait infinitive, but handle all events
 
         // Clean up
@@ -85,10 +147,10 @@ class Program
             catch (Exception ex)
             {
                 retryCount++;
-                Console.WriteLine($"Failed to start SQL dependency: {ex.Message}. Retrying {retryCount}/{maxRetries}...");
+                Log.Logger.Error($"Failed to start SQL dependency: {ex.Message}. Retrying {retryCount}/{maxRetries}...");
                 if (retryCount >= maxRetries)
                 {
-                    Console.WriteLine("Max retry attempts reached. Exiting...");
+                    Log.Logger.Error("Max retry attempts reached. Exiting...");
                     Environment.Exit(1); // Exit the program gracefully
                 }
                 await Task.Delay(delayBetweenRetries);
@@ -108,14 +170,14 @@ class Program
             {
                 using (SqlConnection connection = new SqlConnection(connectionString))
                 {
-                    using (SqlCommand command = new SqlCommand(query, connection))
+                    using (SqlCommand command = new SqlCommand(ChangeDetectQuery, connection))
                     {
                         dependency = new SqlDependency(command);
                         dependency.OnChange += new OnChangeEventHandler(OnDatabaseChange);
 
                         await connection.OpenAsync();
                         await command.ExecuteReaderAsync();
-                        if (retryCount > 0) { Console.WriteLine("Connection to SQL server re-established"); }
+                        if (retryCount > 0) { Log.Logger.Information("Connection to SQL server re-established"); }
                     }
                 }
                 break; // Exit the loop if successful
@@ -123,10 +185,10 @@ class Program
             catch (SqlException ex)
             {
                 retryCount++;
-                Console.WriteLine($"SQL connection error: {ex.Message}. Retrying {retryCount}/{maxRetries}...");
+                Log.Logger.Error($"SQL connection error: {ex.Message}. Retrying {retryCount}/{maxRetries}...");
                 if (retryCount >= maxRetries)
                 {
-                    Console.WriteLine("Max retry attempts reached. Exiting...");
+                    Log.Logger.Error("Max retry attempts reached. Exiting...");
                     Environment.Exit(1); // Exit the program gracefully
                 }
                 await Task.Delay(delayBetweenRetries);
@@ -141,14 +203,14 @@ class Program
             case SqlNotificationType.Change:
                 if (e.Info != SqlNotificationInfo.Error)
                 {
-                    Console.WriteLine("Database change detected!");
+                    Log.Logger.Information("Database change detected!");
 
                     // Fetch new data
                     string? newData = await FetchNewData();
 
                     // Transmit new data via MQTT
                     var message = new MqttApplicationMessageBuilder()
-                        .WithTopic("MSQL/Data")
+                        .WithTopic(MqttTopic)
                         .WithPayload(newData)
                         .WithQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.ExactlyOnce)
                         .WithRetainFlag()
@@ -159,11 +221,11 @@ class Program
                         try
                         {
                             await mqttClient.PublishAsync(message, CancellationToken.None);
-                            Console.WriteLine("Data transmitted via MQTT.");
+                            Log.Logger.Information("Data transmitted via MQTT.");
                         }
                         catch (MqttCommunicationException ex)
                         {
-                            Console.WriteLine($"Failed to send MQTT message: {ex.Message}");
+                            Log.Logger.Error($"Failed to send MQTT message: {ex.Message}");
                             if (newData != null)
                             {
                                 messageCache.Enqueue(newData);
@@ -174,7 +236,7 @@ class Program
                     {
                         if (newData != null)
                         {
-                            Console.WriteLine("Write Change to Cache");
+                            Log.Logger.Information("Write Change to Cache");
                             messageCache.Enqueue(newData);
                         }
                     }
@@ -184,7 +246,7 @@ class Program
                 }
                 else
                 {
-                    Console.WriteLine("SQL server shutdown detected. Attempting to re-register dependency...");
+                    Log.Logger.Information("SQL server shutdown detected. Attempting to re-register dependency...");
                     // Re-register dependency with retry mechanism
                     await RetryRegisterSqlDependency();
                 }
@@ -193,17 +255,17 @@ class Program
             case SqlNotificationType.Subscribe:
                 if (e.Info == SqlNotificationInfo.Error)
                 {
-                    Console.WriteLine("SQL server shutdown detected. Attempting to re-register dependency...");
+                    Log.Logger.Information("SQL server shutdown detected. Attempting to re-register dependency...");
                     await RetryRegisterSqlDependency();
                 }
                 break;
 
             case SqlNotificationType.Unknown:
-                Console.WriteLine("Unknown SQL notification type received.");
+                Log.Logger.Information("Unknown SQL notification type received.");
                 break;
 
             default:
-                Console.WriteLine($"Unhandled SQL notification type: {e.Type}, Info: {e.Info}, Source: {e.Source}");
+                Log.Logger.Information($"Unhandled SQL notification type: {e.Type}, Info: {e.Info}, Source: {e.Source}");
                 break;
         }
     }
@@ -224,10 +286,10 @@ class Program
             catch (SqlException ex)
             {
                 retryCount++;
-                Console.WriteLine($"SQL connection error during re-registration: {ex.Message}. Retrying {retryCount}/{maxRetries}...");
+                Log.Logger.Error($"SQL connection error during re-registration: {ex.Message}. Retrying {retryCount}/{maxRetries}...");
                 if (retryCount >= maxRetries)
                 {
-                    Console.WriteLine("Max retry attempts reached. Exiting...");
+                    Log.Logger.Error("Max retry attempts reached. Exiting...");
                     Environment.Exit(1); // Exit the program gracefully
                 }
                 await Task.Delay(delayBetweenRetries);
@@ -250,7 +312,7 @@ class Program
 
                 using (SqlConnection connection = new SqlConnection(connectionString))
                 {
-                    using (SqlCommand command = new SqlCommand(query, connection))
+                    using (SqlCommand command = new SqlCommand(DataQuery, connection))
                     {
                         await connection.OpenAsync();
                         using (SqlDataReader reader = await command.ExecuteReaderAsync())
@@ -280,10 +342,10 @@ class Program
             catch (SqlException ex)
             {
                 retryCount++;
-                Console.WriteLine($"SQL query error: {ex.Message}. Retrying {retryCount}/{maxRetries}...");
+                Log.Logger.Error($"SQL query error: {ex.Message}. Retrying {retryCount}/{maxRetries}...");
                 if (retryCount >= maxRetries)
                 {
-                    Console.WriteLine("Max retry attempts reached. Returning null...");
+                    Log.Logger.Error("Max retry attempts reached. Returning null...");
                     return null;
                 }
                 await Task.Delay(delayBetweenRetries);
@@ -307,11 +369,11 @@ class Program
             try
             {
                 await mqttClient.PublishAsync(message, CancellationToken.None);
-                Console.WriteLine("Cached data transmitted via MQTT.");
+                Log.Logger.Information("Cached data transmitted via MQTT.");
             }
             catch (MqttCommunicationException ex)
             {
-                Console.WriteLine($"Failed to send cached MQTT message: {ex.Message}");
+                Log.Logger.Error($"Failed to send cached MQTT message: {ex.Message}");
                 messageCache.Enqueue(cachedMessage);
                 break;
             }
