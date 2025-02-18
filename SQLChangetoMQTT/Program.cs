@@ -35,9 +35,14 @@ class Program
         IConfiguration config = host.Services.GetRequiredService<IConfiguration>();
 
         // Read the appsettings.json file from the settings, with default values if not found.
-        connectionString = config.GetValue<string>("DatabaseSettings:ConnectionString") ?? "Server =localhost;Database=pubs;Integrated Security=True;TrustServerCertificate=True;";
-        ChangeDetectQuery = config.GetValue<string>("DatabaseSettings:DataChangeQuery") ?? "\"SELECT au_id, au_lname, au_fname FROM [dbo].[authors]";
-        DataQuery = config.GetValue<string>("DatabaseSettings:DataQuery") ?? "\"SELECT au_id, au_lname, au_fname FROM [dbo].[authors]";
+        var server = config.GetValue<string>("DatabaseSettings:Server") ?? "localhost";
+        var database = config.GetValue<string>("DatabaseSettings:Database") ?? "pubs";
+        var userId = config.GetValue<string>("DatabaseSettings:UserId") ?? "engineer";
+        var password = config.GetValue<string>("DatabaseSettings:Password") ?? "engineer";
+
+        connectionString = $"Server={server};Database={database};User Id={userId};Password={password};TrustServerCertificate=True;";
+        ChangeDetectQuery = config.GetValue<string>("DatabaseSettings:DataChangeQuery") ?? "SELECT au_id, au_lname, au_fname FROM [dbo].[authors]";
+        DataQuery = config.GetValue<string>("DatabaseSettings:DataQuery") ?? "SELECT au_id, au_lname, au_fname FROM [dbo].[authors]";
         MqttClientId = config.GetValue<string>("MqttSettings:ClientId") ?? "ClientID";
         IpAdressMqttBroker = config.GetValue<string>("MqttSettings:IpAddress") ?? "192.168.88.1";
         PortMqttBroker = config.GetValue<int>("MqttSettings:Port");
@@ -58,8 +63,12 @@ class Program
         }
         Log.Logger = loggerConfig.CreateLogger();
 
-        // Set up SQL dependency with retry mechanism
-        await StartSqlDependencyWithRetry();
+        // Check SQL broker and permissions with retry mechanism
+        await CheckSqlBrokerAndPermissions();
+
+        // Set up SQL dependency
+        SqlDependency.Start(connectionString);
+        await RegisterSqlDependency();
 
         Log.Logger.Information("Listening for database changes...");
 
@@ -130,7 +139,7 @@ class Program
 
     private static SqlDependency? dependency;
 
-    private static async Task StartSqlDependencyWithRetry()
+    private static async Task CheckSqlBrokerAndPermissions()
     {
         int retryCount = 0;
         const int maxRetries = 5;
@@ -140,14 +149,40 @@ class Program
         {
             try
             {
-                SqlDependency.Start(connectionString);
-                await RegisterSqlDependency();
+                using (SqlConnection connection = new SqlConnection(connectionString))
+                {
+                    await connection.OpenAsync();
+
+                    // Check if Service Broker is enabled
+                    using (SqlCommand command = new SqlCommand("SELECT is_broker_enabled FROM sys.databases WHERE name = @database", connection))
+                    {
+                        command.Parameters.AddWithValue("@database", connection.Database);
+                        var isBrokerEnabled = (bool)(await command.ExecuteScalarAsync() ?? false);
+                        if (!isBrokerEnabled)
+                        {
+                            Log.Logger.Error("Service Broker is not enabled on the database.");
+                            Environment.Exit(1); // Exit the program gracefully
+                        }
+                    }
+
+                    // Check if the user has the necessary permissions
+                    using (SqlCommand command = new SqlCommand("SELECT HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'SUBSCRIBE QUERY NOTIFICATIONS')", connection))
+                    {
+                        var hasPermissions = (int)(await command.ExecuteScalarAsync() ?? 0);
+                        if (hasPermissions == 0)
+                        {
+                            Log.Logger.Error("User does not have permission to subscribe to query notifications.");
+                            Environment.Exit(1); // Exit the program gracefully
+                        }
+                    }
+                }
+                Log.Logger.Information("SQL connection successful"); 
                 break; // Exit the loop if successful
             }
-            catch (Exception ex)
+            catch (SqlException ex)
             {
                 retryCount++;
-                Log.Logger.Error($"Failed to start SQL dependency: {ex.Message}. Retrying {retryCount}/{maxRetries}...");
+                Log.Logger.Error($"SQL connection error: {ex.Message}. Retrying {retryCount}/{maxRetries}...");
                 if (retryCount >= maxRetries)
                 {
                     Log.Logger.Error("Max retry attempts reached. Exiting...");
@@ -177,7 +212,7 @@ class Program
 
                         await connection.OpenAsync();
                         await command.ExecuteReaderAsync();
-                        if (retryCount > 0) { Log.Logger.Information("Connection to SQL server re-established"); }
+                        if (retryCount > 0) { Log.Logger.Information("Connection to SQL server re-established, Listening for database changes... "); }
                     }
                 }
                 break; // Exit the loop if successful
@@ -246,7 +281,7 @@ class Program
                 }
                 else
                 {
-                    Log.Logger.Information("SQL server shutdown detected. Attempting to re-register dependency...");
+                    Log.Logger.Error("SQL server shutdown detected. Attempting to re-register dependency...");
                     // Re-register dependency with retry mechanism
                     await RetryRegisterSqlDependency();
                 }
@@ -255,7 +290,7 @@ class Program
             case SqlNotificationType.Subscribe:
                 if (e.Info == SqlNotificationInfo.Error)
                 {
-                    Log.Logger.Information("SQL server shutdown detected. Attempting to re-register dependency...");
+                    Log.Logger.Error("SQL server shutdown detected. Attempting to re-register dependency...");
                     await RetryRegisterSqlDependency();
                 }
                 break;
@@ -265,7 +300,7 @@ class Program
                 break;
 
             default:
-                Log.Logger.Information($"Unhandled SQL notification type: {e.Type}, Info: {e.Info}, Source: {e.Source}");
+                Log.Logger.Error($"Unhandled SQL notification type: {e.Type}, Info: {e.Info}, Source: {e.Source}");
                 break;
         }
     }
@@ -360,7 +395,7 @@ class Program
         {
             var cachedMessage = messageCache.Dequeue();
             var message = new MqttApplicationMessageBuilder()
-                .WithTopic("MSQL/Data")
+                .WithTopic(MqttTopic)
                 .WithPayload(cachedMessage)
                 .WithQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.ExactlyOnce)
                 .WithRetainFlag()
