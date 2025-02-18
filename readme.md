@@ -57,17 +57,19 @@ To use `SqlDependency`, the SQL Server user must have the necessary permissions.
 
 1. **Create a Login:**
 ```
-CREATE LOGIN [engineer] WITH PASSWORD = 'engineer';
+CREATE LOGIN [user] WITH PASSWORD = 'userpassword';
 ```
 2. **Create a User in the Database:**
 ```
-USE [pubs]; CREATE USER [engineer] FOR LOGIN [engineer];
+USE [database];
+CREATE USER [user] FOR LOGIN [user];
 ```
 3. **Grant Permissions:**
 ```
-USE [pubs]; GRANT SUBSCRIBE QUERY NOTIFICATIONS TO [engineer]; 
-GRANT RECEIVE ON QueryNotificationErrorsQueue TO [engineer]; 
-GRANT REFERENCES ON CONTRACT::[http://schemas.microsoft.com/SQL/Notifications/PostQueryNotification] TO [engineer];
+USE [pubs];
+GRANT SUBSCRIBE QUERY NOTIFICATIONS TO [user];
+EXEC sp_addrolemember N'db_owner', N'user';
+GO
 ```
 
 4. **Enable Service Broker:**
