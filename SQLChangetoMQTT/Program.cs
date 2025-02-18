@@ -22,6 +22,8 @@ class Program
     private static int PortMqttBroker = 1883;
     private static string? MqttTopic;
     private static string? DebugLocation;
+    private static string? MqttUsername;
+    private static string? MqttPassword;
 
     private static IMqttClient? mqttClient;
     private static MqttClientOptions? mqttOptions;
@@ -48,6 +50,8 @@ class Program
         PortMqttBroker = config.GetValue<int>("MqttSettings:Port");
         MqttTopic = config.GetValue<string>("MqttSettings:Topic") ?? "MSQL/Data";
         DebugLocation = config.GetValue<string>("Logger:location") ?? "Console";
+        MqttUsername = config.GetValue<string>("MqttSettings:Username");
+        MqttPassword = config.GetValue<string>("MqttSettings:Password");
 
         // Set up logger
         var loggerConfig = new LoggerConfiguration()
@@ -75,10 +79,15 @@ class Program
         // Initialize MQTT client
         var factory = new MqttClientFactory();
         mqttClient = factory.CreateMqttClient();
-        mqttOptions = new MqttClientOptionsBuilder()
+        var mqttOptionsBuilder = new MqttClientOptionsBuilder()
             .WithClientId(MqttClientId)
-            .WithTcpServer(IpAdressMqttBroker, PortMqttBroker)
-            .Build();
+            .WithTcpServer(IpAdressMqttBroker, PortMqttBroker);
+        // add authentication for MQTT if provided in appsettings.json
+        if (!string.IsNullOrEmpty(MqttUsername) && !string.IsNullOrEmpty(MqttPassword))
+        {
+            mqttOptionsBuilder.WithCredentials(MqttUsername, MqttPassword);
+        }
+        mqttOptions = mqttOptionsBuilder.Build();
 
         mqttClient.DisconnectedAsync += async e =>
         {
@@ -176,7 +185,7 @@ class Program
                         }
                     }
                 }
-                Log.Logger.Information("SQL connection successful"); 
+                Log.Logger.Information("SQL connection successful");
                 break; // Exit the loop if successful
             }
             catch (SqlException ex)
