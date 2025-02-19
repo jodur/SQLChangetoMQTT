@@ -24,6 +24,7 @@ class Program
     private static string? DebugLocation;
     private static string? MqttUsername;
     private static string? MqttPassword;
+    private static bool MqttFirstconnect=false;
 
     private static IMqttClient? mqttClient;
     private static MqttClientOptions? mqttOptions;
@@ -52,6 +53,7 @@ class Program
         DebugLocation = config.GetValue<string>("Logger:location") ?? "Console";
         MqttUsername = config.GetValue<string>("MqttSettings:Username");
         MqttPassword = config.GetValue<string>("MqttSettings:Password");
+        
 
         // Set up logger
         var loggerConfig = new LoggerConfiguration()
@@ -98,8 +100,9 @@ class Program
         mqttOptions = mqttOptionsBuilder.Build();
 
         mqttClient.DisconnectedAsync += async e =>
-        {
+        { if (!MqttFirstconnect) { return; }
             Log.Logger.Information("Disconnected from MQTT server. Attempting to reconnect...");
+            int retryCount = 0;
             while (!mqttClient.IsConnected)
             {
                 try
@@ -111,18 +114,18 @@ class Program
                 }
                 catch (MqttCommunicationException ex)
                 {
-                    Log.Logger.Error($"Reconnection failed: {ex.Message}");
+                    retryCount++;
+                    if (retryCount % 10 == 0)
+                    {
+                        Log.Logger.Error($"Reconnection failed after {retryCount} attempts: {ex.Message}");
+                    }
                 }
             }
         };
-
-        // Set up retry parameters
-        int retryCount = 0;
-        const int maxRetries = 15;
-        const int delayBetweenRetries = 6000; // 6 seconds
-
+        Log.Logger.Information("Attempt to connect to MQTT server.");
         // Retry loop for MQTT connection
-        while (retryCount < maxRetries)
+        int initialRetryCount = 0;
+        while (true)
         {
             try
             {
@@ -131,19 +134,18 @@ class Program
                 {
                     await mqttClient.ConnectAsync(mqttOptions, cts.Token);
                 }
-                Log.Logger.Information("Connected to MQTT server.");
+                MqttFirstconnect = true;
+                Log.Logger.Information("Connected to MQTT server.");             
                 break; // Exit the loop if successful
             }
             catch (Exception ex)
             {
-                retryCount++;
-                Log.Logger.Error($"Failed to connect to MQTT server: {ex.Message}. Retrying {retryCount}/{maxRetries}...");
-                if (retryCount >= maxRetries)
+                initialRetryCount++;
+                if (initialRetryCount % 10 == 0)
                 {
-                    Log.Logger.Error("Max retry attempts reached. Exiting...");
-                    Environment.Exit(1); // Exit the program gracefully
+                    Log.Logger.Error($"Failed to connect to MQTT server after {initialRetryCount} attempts. Retrying...");
                 }
-                await Task.Delay(delayBetweenRetries);
+                await Task.Delay(TimeSpan.FromSeconds(6)); // Wait before retrying
             }
         }
 
