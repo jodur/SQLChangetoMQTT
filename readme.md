@@ -66,7 +66,7 @@ CREATE USER [user] FOR LOGIN [user];
 ```
 3. **Grant Permissions:**
 ```
-USE [pubs];
+USE [database];
 GRANT SUBSCRIBE QUERY NOTIFICATIONS TO [user];
 EXEC sp_addrolemember N'db_owner', N'user';
 GO
@@ -76,7 +76,7 @@ GO
 
 Ensures that the Service Broker is enabled for the database:
 ```
-ALTER DATABASE [pubs] SET ENABLE_BROKER;
+ALTER DATABASE [database] SET ENABLE_BROKER;
 ```
    
 

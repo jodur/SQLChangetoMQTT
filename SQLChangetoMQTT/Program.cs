@@ -71,7 +71,15 @@ class Program
         await CheckSqlBrokerAndPermissions();
 
         // Set up SQL dependency
-        SqlDependency.Start(connectionString);
+        try
+        {
+            SqlDependency.Start(connectionString);
+        }
+        catch (SqlException ex)
+        {
+            Log.Logger.Error($"Failed to start SQL dependency: {ex.Message}");
+            Environment.Exit(1); // Exit the program gracefully
+        }
         await RegisterSqlDependency();
 
         Log.Logger.Information("Listening for database changes...");
